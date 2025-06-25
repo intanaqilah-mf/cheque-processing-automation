@@ -1,50 +1,72 @@
-const axios = require('axios');
+// server/services/ocrService.js
+
+const { ImageAnnotatorClient } = require('@google-cloud/vision');
 const fs = require('fs');
 
-const GOOGLE_VISION_API_URL = `https://vision.googleapis.com/v1/images:annotate?key=${process.env.OCR_API_KEY}`;
-
-const getTextFromImage = async (imagePath) => {
-    const imageFile = fs.readFileSync(imagePath);
-    const encodedImage = Buffer.from(imageFile).toString('base64');
-
-    const requestBody = {
-        requests: [{
-            image: { content: encodedImage },
-            features: [{ type: 'TEXT_DETECTION' }]
-        }]
-    };
-
-    const response = await axios.post(GOOGLE_VISION_API_URL, requestBody);
-    
-    if (response.data.responses[0]?.fullTextAnnotation?.text) {
-        return response.data.responses[0].fullTextAnnotation.text;
+// Helper function to find a value near a keyword anchor
+const findValueNear = (text, keyword, pattern) => {
+    try {
+        const keywordRegex = new RegExp(`${keyword}(.+)`, 'i');
+        const keywordMatch = text.match(keywordRegex);
+        if (keywordMatch && keywordMatch[1]) {
+            const patternMatch = keywordMatch[1].trim().match(pattern);
+            if (patternMatch) {
+                return patternMatch[1] || patternMatch[0];
+            }
+        }
+    } catch (e) {
+        // Ignore regex errors for this helper
     }
-    throw new Error('Could not extract text from image.');
+    return null;
 };
 
-const parseChequeText = (text) => {
+const processCheque = async (imagePath) => {
+    // 1. Initialize Google Vision Client and get raw text
+    const client = new ImageAnnotatorClient();
+    const [result] = await client.textDetection(imagePath);
+    const rawText = result.fullTextAnnotation?.text;
+
+    if (!rawText) {
+        throw new Error('Could not extract any text from the image.');
+    }
+    
+    // 2. Initialize the data structure based on your Mongoose model
     const data = {
         payeeName: 'N/A',
         amount: 0,
         amountInWords: 'N/A',
         chequeDate: 'N/A',
-        micr: { chequeNo: 'N/A', bankCode: 'N/A', branchCode: 'N/A', payerAccountNo: 'N/A' },
+        payerName: 'N/A',
+        micr: { raw: 'N/A', chequeNo: 'N/A', bankCode: 'N/A', branchCode: 'N/A', payerAccountNo: 'N/A', cdv: 'N/A', tranCode: 'N/A' },
+        bankBranchCodeCenter: 'N/A',
         needsReview: false,
         reviewNotes: [],
     };
 
-    // 1. Parse Date (DDMMYY format)
-    const dateRegex = /(\d{2})\s*(\d{2})\s*(\d{2,4})/;
-    const dateMatch = text.match(dateRegex);
+    // 3. Define more robust Regex patterns
+    // This pattern looks for the spaced-out DD MM YY format inside the date box
+    const dateRegex = /(?:Date|Tarikh)[\s\S]*?(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)/i;
+    const amountRegex = /RM\s*([,\d]+\.\d{2})/;
+    // This pattern looks for the word PAY/BAYAR and captures the rest of that specific line
+    const payeeRegex = /(?:PAY|BAYAR\/)\s*([^\n]+)/i;
+    // This pattern finds the amount in words, which is often uppercase
+    const amountWordsRegex = /(?:RINGGIT MALAYSIA|MALAYSIA\/)\s*([A-Z\s]+?)(?:ONLY|SAHAJA)/i;
+    // This pattern is more flexible for the MICR line, tolerating different symbols
+    const micrRegex = /(?:\s|⑆)(\d{2})(?:\s|⑈)[\s\S]*?⑆(\d{6})⑈\s*(\d{2}-\d{5})\s*⑆(\d+)⑈\s*(\d{2})/;
+    // A simplified MICR regex as a fallback
+    const simpleMicrRegex = /⑆\s*(\d+)\s*⑈\s*(\d+)\s*⑆\s*(\d+)\s*⑈\s*(\d+)/;
+    const centerCodeRegex = /(\d{2}-\d{5})/;
+
+    // 4. Execute parsing for each field
+    const dateMatch = rawText.match(dateRegex);
     if (dateMatch) {
-        data.chequeDate = `${dateMatch[1]}-${dateMatch[2]}-20${dateMatch[3]}`; // Assuming YY format
+        data.chequeDate = `${dateMatch[1]}${dateMatch[2]}-${dateMatch[3]}${dateMatch[4]}-20${dateMatch[5]}${dateMatch[6]}`;
     } else {
         data.needsReview = true;
         data.reviewNotes.push("Could not parse date.");
     }
-
-    const amountRegex = /RM\s*([\d,]+\.\d{2})/;
-    const amountMatch = text.match(amountRegex);
+    
+    const amountMatch = rawText.match(amountRegex);
     if (amountMatch && amountMatch[1]) {
         data.amount = parseFloat(amountMatch[1].replace(/,/g, ''));
     } else {
@@ -52,38 +74,58 @@ const parseChequeText = (text) => {
         data.reviewNotes.push("Could not parse amount in figures.");
     }
 
-    const payeeRegex = /PAY\s*([^\n]+)/;
-    const payeeMatch = text.match(payeeRegex);
+    const payeeMatch = rawText.match(payeeRegex);
     if (payeeMatch && payeeMatch[1]) {
-        data.payeeName = payeeMatch[1].trim();
+        data.payeeName = payeeMatch[1].trim().replace(/\n/g, ' '); // Clean up newlines
     } else {
         data.needsReview = true;
         data.reviewNotes.push("Could not parse payee name.");
     }
-
-    const amountWordsRegex = /RINGGIT\s*MALAYSIA\/.*?([A-Z\s]+?)\s*ONLY/;
-    const amountWordsMatch = text.match(amountWordsRegex);
+    
+    const amountWordsMatch = rawText.match(amountWordsRegex);
     if (amountWordsMatch && amountWordsMatch[1]) {
-        data.amountInWords = amountWordsMatch[1].trim().replace(/\s+/g, ' ');
+        data.amountInWords = amountWordsMatch[1].replace(/\s+/g, ' ').trim();
     } else {
         data.needsReview = true;
         data.reviewNotes.push("Could not parse amount in words.");
     }
-    
-    const micrRegex = /⑆\s*(\d+)\s*⑈\s*(\d+)\s*⑆\s*(\d+)\s*⑈/;
-    const micrMatch = text.match(micrRegex);
-    if (micrMatch) {
-        data.micr.chequeNo = micrMatch[1];
-        const bankBranch = micrMatch[2];
-        data.micr.bankCode = bankBranch.substring(0, 2); 
-        data.micr.branchCode = bankBranch.substring(2); 
-        data.micr.payerAccountNo = micrMatch[3];
+
+    const centerCodeMatch = rawText.match(centerCodeRegex);
+    if (centerCodeMatch) {
+        data.bankBranchCodeCenter = centerCodeMatch[1];
+    }
+
+    // --- MICR Parsing ---
+    const micrBlockMatch = rawText.match(simpleMicrRegex);
+    if (micrBlockMatch) {
+        data.micr.raw = micrBlockMatch[0].trim();
+        data.micr.chequeNo = micrBlockMatch[1];
+        const bankAndBranch = micrBlockMatch[2];
+        data.micr.bankCode = bankAndBranch.substring(0, 2);
+        data.micr.branchCode = bankAndBranch.substring(2);
+        data.micr.payerAccountNo = micrBlockMatch[3];
+        data.micr.tranCode = micrBlockMatch[4];
     } else {
         data.needsReview = true;
         data.reviewNotes.push("Could not parse MICR line.");
     }
+    
+    // Heuristic for Payer Name (often bottom-left, might need review)
+    const lines = rawText.split('\n');
+    const signatureLineIndex = lines.findIndex(line => line.toUpperCase().includes('SIGNATURE') || line.toUpperCase().includes('TANDATANGAN'));
+    if (signatureLineIndex > 1) {
+        // Assume the payer name is on the line above the signature line
+        const potentialPayerLine = lines[signatureLineIndex - 2] || lines[signatureLineIndex - 1];
+        // Filter out non-alphabetic characters that might be noise
+        data.payerName = potentialPayerLine.replace(/[^a-zA-Z\s]/g, '').trim();
+    }
+     if (data.payerName === 'N/A' || data.payerName.length < 3) {
+        data.needsReview = true;
+        data.reviewNotes.push("Could not parse payer name.");
+    }
 
-    return data;
+    // 5. Return all the extracted data
+    return { ...data, rawText };
 };
 
-module.exports = { getTextFromImage, parseChequeText };
+module.exports = { processCheque };

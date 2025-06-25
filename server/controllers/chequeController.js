@@ -1,5 +1,8 @@
+// server/controllers/chequeController.js
+
 const Cheque = require('../models/Cheque');
-const { getTextFromImage, parseChequeText } = require('../services/ocrService');
+// We now only need to import the single 'processCheque' function
+const { processCheque } = require('../services/ocrService');
 const fs = require('fs');
 const axios = require('axios');
 
@@ -9,16 +12,19 @@ const processNewCheque = async (req, res) => {
     }
 
     try {
-        const rawText = await getTextFromImage(req.file.path);
-        const parsedData = parseChequeText(rawText);
+        // --- THIS IS THE UPDATED LOGIC ---
+        // Call the single, powerful function to get all extracted data at once.
+        const extractedData = await processCheque(req.file.path);
 
+        // Create the new cheque document with the data from the service.
         const newCheque = new Cheque({
-            ...parsedData,
-            rawText: rawText,
-            imageUrl: req.file.path,
+            ...extractedData,
+            imageUrl: req.file.filename, // Keep using .filename for the image URL
         });
+        // --- END OF UPDATED LOGIC ---
 
         await newCheque.save();
+
         if (newCheque.needsReview && process.env.N8N_WEBHOOK_URL) {
             try {
                 await axios.post(process.env.N8N_WEBHOOK_URL, newCheque.toJSON());
@@ -26,16 +32,19 @@ const processNewCheque = async (req, res) => {
                 console.error("Failed to trigger n8n webhook:", error.message);
             }
         }
-        //fs.unlinkSync(req.file.path);
+        
+        // We will keep the image file now so it can be displayed
+        // fs.unlinkSync(req.file.path); 
+        
         res.status(201).json(newCheque);
 
     } catch (error) {
-    console.error('*** CHEQUE PROCESSING ERROR ***:', error); 
-    if (req.file && fs.existsSync(req.file.path)) {
-        fs.unlinkSync(req.file.path);
+        console.error('*** CHEQUE PROCESSING ERROR ***:', error);
+        if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ message: 'Server error during cheque processing.', error: error.message });
     }
-    res.status(500).json({ message: 'Server error during cheque processing.', error: error.message });
-}
 };
 
 const getReviewCheques = async (req, res) => {
