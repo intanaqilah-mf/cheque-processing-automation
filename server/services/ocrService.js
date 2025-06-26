@@ -2,20 +2,28 @@ const { ImageAnnotatorClient } = require('@google-cloud/vision');
 const fs = require('fs');
 const moment = require('moment'); 
 
+// --- FIX #1: This function is now more robust against Gemini's output format ---
 const callGeminiAPI = async (prompt, text) => {
-
     const { GoogleGenerativeAI } = require('@google/generative-ai');
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); // Ensure API_KEY is set in your .env
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); 
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     try {
         const result = await model.generateContent(prompt + "\n" + text);
         const response = await result.response;
-        const jsonText = response.text(); // Assuming Gemini returns a JSON string
-        return JSON.parse(jsonText);
+        const fullResponseText = response.text();
+
+        // Use a regular expression to reliably find and extract the JSON object
+        const jsonMatch = fullResponseText.match(/\{[\s\S]*\}/);
+
+        if (jsonMatch && jsonMatch[0]) {
+            return JSON.parse(jsonMatch[0]);
+        } else {
+            throw new Error("No valid JSON object found in Gemini response.");
+        }
     } catch (error) {
-        console.error('Error calling Gemini API:', error);
-        return null; // Handle API errors
+        console.error('Error calling or parsing Gemini API:', error);
+        return null;
     }
 };
 
@@ -39,16 +47,17 @@ const processCheque = async (imagePath) => {
         needsReview: false,
         reviewNotes: [],
     };
-
-    // Regex-based extraction (first pass or fallback)
-    const payeeRegex = /(?:PAY|BAYAR\/)\s*([^\n]+)/i;
-    const payeeMatch = rawText.match(payeeRegex);
-    if (payeeMatch && payeeMatch[1]) {
-        data.payeeName = payeeMatch[1].trim().replace(/\n/g, ' ');
+    
+    // --- FIX #2: Using only one, more reliable method for Payee Name ---
+    const lines = rawText.split('\n');
+    const payeeLineIndex = lines.findIndex(line => line.toUpperCase().includes('PAY') || line.toUpperCase().includes('BAYAR'));
+    if (payeeLineIndex !== -1 && payeeLineIndex + 1 < lines.length) {
+        data.payeeName = lines[payeeLineIndex + 1].trim().replace(/\.|,/g, '');
     } else {
         data.needsReview = true;
         data.reviewNotes.push("Could not parse payee name using regex.");
     }
+    // The redundant payeeRegex block has been removed.
 
     const amountBearerRegex = /(?:ATAU\s*PEMBAWA|OR\s*BEARER)\s*(?:RM)?\s*([\d,]+\.\d{2})/i;
     const amountRmRegex = /RM\s*([\d,]+\.\d{2})/i;
@@ -85,7 +94,6 @@ const processCheque = async (imagePath) => {
             year = `20${year}`;
         }
         
-        // Handle "no month 83 so it might be month 3"
         if (month.length === 2 && month.startsWith('8')) {
             const potentialMonth = parseInt(month.substring(1), 10);
             if (potentialMonth >= 1 && potentialMonth <= 12) {
@@ -132,33 +140,15 @@ const processCheque = async (imagePath) => {
     }
     
     // Gemini Enhanced Parsing
-    const geminiPrompt = `Extract key information from this cheque image OCR text.
-    Output a JSON object with the following keys:
-    - "payeeName": (String) The name of the recipient, found after "PAY" or "BAYAR".
-    - "amount": (Number) The numerical amount in RM, e.g., "200.00". Prioritize amounts near "ATAU PEMBAWA" or "OR BEARER".
-    - "amountInWords": (String) The amount spelled out, after "RINGGIT MALAYSIA" or "MALAYSIA".
-    - "chequeDate": (String) The date in "DD-MM-YYYY" format. Correct two-digit years (e.g., "24" -> "2024"). If month is "83", interpret as "03".
-    - "payerName": (String) The name of the cheque issuer, consisting of words, distinct from numbers.
-    - "payerAccountNo": (String) The payer's account number (can be from MICR or other parts).
-    - "bankBranchCodeCenter": (String) The bank/branch code in "XX-XXXXX" format.
-    - "micr": (Object) Detailed MICR fields.
-        - "raw": (String) The full MICR line.
-        - "chequeNo": (String) Cheque serial number.
-        - "bankCode": (String) Bank code.
-        - "branchCode": (String) Branch code.
-        - "payerAccountNoFromMicr": (String) Payer's account number from MICR.
-        - "tranCode": (String) Transaction code.
-    - "needsReview": (Boolean) True if any info is uncertain or missing.
-    - "reviewNotes": (Array of Strings) Reasons for review.
-
+    const geminiPrompt = `Extract key information from this cheque image OCR text. Output a single, clean JSON object without any markdown formatting or extra text.
+    The JSON object must have keys like "payeeName", "amount", "amountInWords", "chequeDate", etc. If a value cannot be found, use "N/A" for strings or 0 for numbers.
     OCR Text: \`\`\`${rawText}\`\`\``;
 
     try {
         const geminiResponse = await callGeminiAPI(geminiPrompt, rawText);
-        if (geminiResponse && geminiResponse.extractedFields) {
-            const geminiExtracted = geminiResponse.extractedFields;
+        if (geminiResponse) {
+            const geminiExtracted = geminiResponse.extractedFields || geminiResponse; // Handle both cases
             
-            // Apply Gemini's extracted values, prioritizing them
             if (geminiExtracted.payeeName && geminiExtracted.payeeName !== 'N/A') data.payeeName = geminiExtracted.payeeName;
             if (geminiExtracted.amount && parseFloat(geminiExtracted.amount) !== 0) data.amount = parseFloat(geminiExtracted.amount);
             if (geminiExtracted.amountInWords && geminiExtracted.amountInWords !== 'N/A') data.amountInWords = geminiExtracted.amountInWords;
@@ -167,41 +157,25 @@ const processCheque = async (imagePath) => {
             if (geminiExtracted.bankBranchCode && geminiExtracted.bankBranchCode !== 'N/A') data.bankBranchCodeCenter = geminiExtracted.bankBranchCode;
 
             if (geminiExtracted.micr) {
-                if (geminiExtracted.micr.raw && geminiExtracted.micr.raw !== 'N/A') data.micr.raw = geminiExtracted.micr.raw;
-                if (geminiExtracted.micr.chequeNo && geminiExtracted.micr.chequeNo !== 'N/A') data.micr.chequeNo = geminiExtracted.micr.chequeNo;
-                if (geminiExtracted.micr.bankCode && geminiExtracted.micr.bankCode !== 'N/A') data.micr.bankCode = geminiExtracted.micr.bankCode;
-                if (geminiExtracted.micr.branchCode && geminiExtracted.micr.branchCode !== 'N/A') data.micr.branchCode = geminiExtracted.micr.branchCode;
-                if (geminiExtracted.micr.payerAccountNoFromMicr && geminiExtracted.micr.payerAccountNoFromMicr !== 'N/A') data.micr.payerAccountNo = geminiExtracted.micr.payerAccountNoFromMicr;
-                if (geminiExtracted.micr.tranCode && geminiExtracted.micr.tranCode !== 'N/A') data.micr.tranCode = geminiExtracted.micr.tranCode;
-            }
-
-            if (geminiResponse.needsReview === true) data.needsReview = true;
-            if (Array.isArray(geminiResponse.reviewNotes) && geminiResponse.reviewNotes.length > 0) {
-                data.reviewNotes = [...new Set([...data.reviewNotes, ...geminiResponse.reviewNotes])];
+                data.micr = { ...data.micr, ...geminiExtracted.micr };
             }
         }
     } catch (geminiError) {
-        console.error('Gemini API call failed:', geminiError.message);
+        console.error('Gemini API call failed during processing:', geminiError.message);
         data.needsReview = true;
         data.reviewNotes.push("Failed to get enhanced parsing from Gemini API.");
     }
     
-    // Final check for review flags
-    const requiredFields = [
-        data.payeeName, data.amount, data.amountInWords, data.chequeDate,
-        data.payerName, data.micr.raw, data.bankBranchCodeCenter
-    ];
-    if (requiredFields.some(field => (typeof field === 'string' && field === 'N/A') || (typeof field === 'number' && field === 0))) {
-        data.needsReview = true;
-        if (data.payeeName === 'N/A') data.reviewNotes.push("Payee Name missing.");
-        if (data.amount === 0) data.reviewNotes.push("Amount missing.");
-        if (data.amountInWords === 'N/A') data.reviewNotes.push("Amount in Words missing.");
-        if (data.chequeDate === 'N/A') data.reviewNotes.push("Cheque Date missing.");
-        if (data.payerName === 'N/A') data.reviewNotes.push("Payer Name missing.");
-        if (data.micr.raw === 'N/A') data.reviewNotes.push("MICR raw data missing.");
-        if (data.bankBranchCodeCenter === 'N/A') data.reviewNotes.push("Bank Branch Code Center missing.");
-    }
-    data.reviewNotes = [...new Set(data.reviewNotes)]; // Ensure unique review notes
+    const requiredFields = ['payeeName', 'amount', 'amountInWords', 'chequeDate', 'payerName', 'micr.raw', 'bankBranchCodeCenter'];
+    requiredFields.forEach(field => {
+        const value = field.includes('.') ? data[field.split('.')[0]][field.split('.')[1]] : data[field];
+        if ((typeof value === 'string' && value === 'N/A') || (typeof value === 'number' && value === 0)) {
+            data.needsReview = true;
+            data.reviewNotes.push(`${field} missing or invalid.`);
+        }
+    });
+    
+    data.reviewNotes = [...new Set(data.reviewNotes)];
 
     return { ...data, rawText };
 };
