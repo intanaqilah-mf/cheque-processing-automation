@@ -110,39 +110,53 @@ const processCheque = async (imagePath) => {
     }
 
     // --- Refined Date Extraction ---
-    const spacedDatePattern = /(?:Tarikh|Date)\s*:?\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)/i;
-    let dateMatch = rawText.match(spacedDatePattern);
-    if (dateMatch) {
-        const day = `${dateMatch[1]}${dateMatch[2]}`;
-        const month = `${dateMatch[3]}${dateMatch[4]}`;
-        const year = `20${dateMatch[5]}${dateMatch[6]}`;
-        const parsedDate = moment(`${day}-${month}-${year}`, "DD-MM-YYYY", true);
-        if (parsedDate.isValid()) {
-            data.chequeDate = parsedDate.format("DD-MM-YYYY");
-        } else {
-            data.needsReview = true;
-            data.reviewNotes.push(`Invalid spaced date detected: ${day}-${month}-${year}.`);
-        }
-    } else {
-        const standardDatePattern = /(?:Tarikh|Date)\s*:?\s*(\d{1,2})[ \/-]?(\d{1,2})[ \/-]?(\d{2,4})/i;
-        dateMatch = rawText.match(standardDatePattern);
-        if (dateMatch) {
-            let day = dateMatch[1].padStart(2, '0');
-            let month = dateMatch[2].padStart(2, '0');
-            let year = dateMatch[3];
-            if (year.length === 2) year = `20${year}`;
+    let chequeDate = 'N/A'; // Default to rejection
+    const dateLabelIndex = lines.findIndex(line => /Tarikh|Date/i.test(line));
 
-            const parsedDate = moment(`${day}-${month}-${year}`, "DD-MM-YYYY", true);
-            if (parsedDate.isValid()) {
-                data.chequeDate = parsedDate.format("DD-MM-YYYY");
-            } else {
-                data.needsReview = true;
-                data.reviewNotes.push(`Could not validate date from string: ${dateMatch[0]}.`);
+    if (dateLabelIndex !== -1) {
+        // Define a search area of the next 3 lines after the label is found.
+        const searchArea = lines.slice(dateLabelIndex, dateLabelIndex + 3);
+        
+        for (const line of searchArea) {
+            const candidate = line.trim();
+
+            // If a date has already been found in the search area, stop.
+            if (chequeDate !== 'N/A') break;
+
+            // STRICT PATTERN 1: Accepts only a solid 6-digit block, e.g., "010124"
+            let match = candidate.match(/^(\d{6})$/);
+            if (match) {
+                const day = match[1].substring(0, 2);
+                const month = match[1].substring(2, 4);
+                const year = `20${match[1].substring(4, 6)}`;
+                const parsedDate = moment(`${day}-${month}-${year}`, "DD-MM-YYYY", true);
+                if (parsedDate.isValid()) {
+                    chequeDate = parsedDate.format("DD-MM-YYYY");
+                    continue; // Found it, stop searching this line
+                }
             }
-        } else {
-            data.needsReview = true;
-            data.reviewNotes.push("Could not find date.");
+            
+            // STRICT PATTERN 2: Accepts only 6 digits separated by spaces, e.g., "2 5 0 9 12"
+            match = candidate.match(/^(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)$/);
+            if (match) {
+                const day = `${match[1]}${match[2]}`;
+                const month = `${match[3]}${match[4]}`;
+                const year = `20${match[5]}${match[6]}`;
+                const parsedDate = moment(`${day}-${month}-${year}`, "DD-MM-YYYY", true);
+                if (parsedDate.isValid()) {
+                    chequeDate = parsedDate.format("DD-MM-YYYY");
+                    continue; // Found it, stop searching this line
+                }
+            }
         }
+    }
+    
+    // Assign the final result. If no strict pattern matched, it remains 'N/A'.
+    data.chequeDate = chequeDate;
+
+    if (data.chequeDate === 'N/A') {
+        data.needsReview = true;
+        data.reviewNotes.push("Date format is invalid or not found in the expected location.");
     }
 
 
@@ -194,7 +208,7 @@ const processCheque = async (imagePath) => {
             if ((data.payeeName === 'N/A' || data.payeeName.length < 3) && geminiResponse.payeeName && geminiResponse.payeeName !== 'N/A') data.payeeName = geminiResponse.payeeName;
             if (data.amount === 0 && geminiResponse.amount && parseFloat(geminiResponse.amount) !== 0) data.amount = parseFloat(geminiResponse.amount);
             if (data.amountInWords === 'N/A' && geminiResponse.amountInWords && geminiResponse.amountInWords !== 'N/A') data.amountInWords = geminiResponse.amountInWords;
-            if (data.chequeDate === 'N/A' && geminiResponse.chequeDate && moment(geminiResponse.chequeDate, "DD-MM-YYYY", true).isValid()) data.chequeDate = geminiResponse.chequeDate;
+            // if (data.chequeDate === 'N/A' && geminiResponse.chequeDate && moment(geminiResponse.chequeDate, "DD-MM-YYYY", true).isValid()) data.chequeDate = geminiResponse.chequeDate;
             
             if (geminiResponse.payerName && geminiResponse.payerName !== 'N/A') data.payerName = geminiResponse.payerName;
             
