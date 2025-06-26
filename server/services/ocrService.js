@@ -1,298 +1,111 @@
 const { ImageAnnotatorClient } = require('@google-cloud/vision');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const moment = require('moment');
+const fs = require('fs');
 
-// This function calls the Gemini API to extract data from the OCR text as a fallback.
-const callGeminiAPI = async (prompt, text) => {
-    const { GoogleGenerativeAI } = require('@google/generative-ai');
+// NEW HELPER: Converts image file to a Generative AI part object
+function fileToGenerativePart(path, mimeType) {
+    return {
+        inlineData: {
+            data: Buffer.from(fs.readFileSync(path)).toString("base64"),
+            mimeType
+        },
+    };
+}
+
+// UPDATED HELPER: Calls Gemini with the image and a targeted prompt
+const callGeminiVisionAPI = async (imagePath) => {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
+    const prompt = `
+        Analyze the following image of a bank cheque. Extract the following information and return it as a clean JSON object. Do not include any markdown or explanatory text outside the JSON.
+        - payeeName: The name of the person or company to be paid.
+        - payerName: The name of the person signing or issuing the cheque (often a standalone name near the signature line).
+        - amountInWords: The full written amount in words.
+        - chequeDate: The date on the cheque, formatted as DD-MM-YYYY.
+
+        The JSON object must have these exact keys: "payeeName", "payerName", "amountInWords", "chequeDate".
+        If a value is unclear, use "N/A".
+    `;
+
     try {
-        const result = await model.generateContent(prompt + "\n" + text);
+        const imagePart = fileToGenerativePart(imagePath, "image/jpeg");
+        const result = await model.generateContent([prompt, imagePart]);
         const response = await result.response;
         const fullResponseText = response.text();
-
+        
         const jsonMatch = fullResponseText.match(/\{[\s\S]*\}/);
-
         if (jsonMatch && jsonMatch[0]) {
             return JSON.parse(jsonMatch[0]);
         } else {
-            throw new Error("No valid JSON object found in Gemini response.");
+            throw new Error("No valid JSON object found in Gemini Vision response.");
         }
     } catch (error) {
-        console.error('Error calling or parsing Gemini API:', error);
-        return null;
-    }
-};
-const callGeminiTextAPI = async (prompt) => {
-    const { GoogleGenerativeAI } = require('@google/generative-ai');
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-    try {
-        const result = await model.generateContent(prompt);
-        const response = await result.response;
-        return response.text();
-    } catch (error) {
-        console.error('Error calling Gemini Text API:', error);
+        console.error('Error calling or parsing Gemini Vision API:', error);
         return null;
     }
 };
 
-// Helper function to remove known non-data text from the raw OCR output.
-const cleanRawText = (text) => {
-    return text
-        .replace(/STAMP DUTY PAID/gi, '')
-        .replace(/A\/C PAYEE ONLY/gi, '')
-        .replace(/NO SIGNATURE BELOW THIS LINE/gi, '')
-        .replace(/JANGAN TANDATANGAN DI BAWAH GARISAN INI/gi, '');
-};
 
-
+// REWRITTEN processCheque function
 const processCheque = async (imagePath) => {
+    // =================================================================
+    // STEP 1: Get structured data directly from Gemini Vision
+    // =================================================================
+    const visionData = await callGeminiVisionAPI(imagePath);
+
+    const data = {
+        payeeName: visionData?.payeeName || 'N/A',
+        payerName: visionData?.payerName || 'N/A',
+        amountInWords: visionData?.amountInWords || 'N/A',
+        chequeDate: visionData?.chequeDate || 'N/A', // Using Gemini's result for the date
+        amount: 0,
+        micr: { raw: 'N/A', chequeNo: 'N/A', bankCode: 'N/A', branchCode: 'N/A', payerAccountNo: 'N/A', tranCode: 'N/A' },
+        bankBranchCodeCenter: 'N/A',
+        needsReview: true,
+        reviewNotes: [],
+    };
+
+    // =================================================================
+    // STEP 2: Use regex ONLY for simple, highly structured fields
+    // =================================================================
     const client = new ImageAnnotatorClient();
     const [result] = await client.textDetection(imagePath);
     let rawText = result.fullTextAnnotation?.text;
 
-    // =================================================================
-    // THIS IS THE LOG YOU ASKED FOR.
-    // It prints the entire raw text from the OCR before any cleaning or processing.
-    console.log('-------------------- RAW OCR OUTPUT START --------------------');
-    console.log(rawText);
-    console.log('--------------------  RAW OCR OUTPUT END  --------------------');
-    // =================================================================
-
     if (!rawText) {
-        throw new Error('Could not extract any text from the image.');
+        data.needsReview = true;
+        data.reviewNotes.push("Could not extract any OCR text from image.");
+        return { ...data, rawText: "OCR FAILED" };
     }
-
-    rawText = cleanRawText(rawText);
-
-    const data = {
-        payeeName: 'N/A',
-        amount: 0,
-        amountInWords: 'N/A',
-        chequeDate: 'N/A',
-        payerName: 'N/A',
-        micr: { raw: 'N/A', chequeNo: 'N/A', bankCode: 'N/A', branchCode: 'N/A', payerAccountNo: 'N/A', tranCode: 'N/A' },
-        bankBranchCodeCenter: 'N/A',
-        needsReview: false,
-        reviewNotes: [],
-    };
-
+    
     const lines = rawText.split('\n');
 
-    // --- Final, Highly-Targeted Payee Name Extraction ---
-    let payeeName = 'N/A';
-    const payeeLineIndex = lines.findIndex(line => line.toUpperCase().includes('PAY') || line.toUpperCase().includes('BAYAR'));
-
-    if (payeeLineIndex !== -1) {
-        let rawPayeeLine = lines[payeeLineIndex];
-        let cleanedPayeeLine = rawPayeeLine.replace(/^(PAY|BAYAR)[\s\/]*[^\sa-zA-Z0-9]*/i, '').trim();
-        cleanedPayeeLine = cleanedPayeeLine.replace(/SAMPLE/gi, '').trim();
-        const finalPayeeMatch = cleanedPayeeLine.match(/^([a-zA-Z0-9\s,.'-]*)/);
-        if (finalPayeeMatch && finalPayeeMatch[0]) {
-            payeeName = finalPayeeMatch[0].trim();
-        }
-    }
-    
-    data.payeeName = payeeName;
-
-    const rawAmountRegex = /RM\s*(.*)/i;
-     const rawAmountMatch = rawText.match(rawAmountRegex);
-
-         if (rawAmountMatch && rawAmountMatch[1]) {
-         const rawAmountStr = rawAmountMatch[1].trim();
-
-         const cleanedAmountStr = rawAmountStr.replace(/[^\d.]/g, '');
-         if (/[a-zA-Z-\/]/.test(rawAmountStr)) {
-             data.needsReview = true;
-            data.reviewNotes.push("Amount in figures contains invalid characters.");
-    }
-    if (cleanedAmountStr) {
-             data.amount = parseFloat(cleanedAmountStr);
-            } else {
-             data.amount = 0;
-             }
-
-        } else {
-         data.needsReview = true;
-             data.reviewNotes.push("Could not parse amount in figures.");
-     }
-
-    // --- Amount (Words) Extraction ---
-    const amountWordsRegex = /(?:RINGGIT MALAYSIA|RINGGIT)[\s\S]*?([a-zA-Z\s.,'-]+?)(?:SAHAJA|ONLY)/i;
-    const amountWordsMatch = rawText.match(amountWordsRegex);
-    if (amountWordsMatch && amountWordsMatch[1]) {
-        data.amountInWords = amountWordsMatch[1].replace(/\s+/g, ' ').trim();
-    } else {
-        data.needsReview = true;
-        data.reviewNotes.push("Could not parse amount in words.");
-    }
-
-    if (data.amountInWords !== 'N/A') {
-        const validationPrompt = `Does the following text describe a number in English or Malay, even with potential spelling errors? Answer only with a single word: YES or NO.\n\nText: "${data.amountInWords}"`;
-
-        try {
-            // CORRECTED: Use the new function for text-only responses.
-            const validationResponse = await callGeminiTextAPI(validationPrompt);
-            
-            if (!validationResponse || validationResponse.trim().toUpperCase() !== 'YES') {
-                data.needsReview = true;
-                data.reviewNotes.push("Amount in words is not a valid number description.");
-            }
-        } catch (error) {
-            console.error('AI validation for amount in words failed:', error);
-            // Flag for review if the validation check itself fails.
-            data.needsReview = true;
-            data.reviewNotes.push("Could not verify the amount in words."); 
+    // --- Amount (Figures) Extraction ---
+    const rawAmountMatch = rawText.match(/RM\s*([0-9,]+(?:[.x\s]*\d*))/i);
+    if (rawAmountMatch && rawAmountMatch[1]) {
+        const cleanedAmountStr = rawAmountMatch[1].replace(/[^0-9.]/g, '');
+        if (cleanedAmountStr) {
+            data.amount = parseFloat(cleanedAmountStr);
         }
     }
 
-    // --- Refined Date Extraction ---
-    let chequeDate = 'N/A'; // Default to rejection
-    const dateLabelIndex = lines.findIndex(line => /Tarikh|Date/i.test(line));
-
-    if (dateLabelIndex !== -1) {
-        // Define a search area of the next 3 lines after the label is found.
-        const searchArea = lines.slice(dateLabelIndex, dateLabelIndex + 3);
-        
-        for (const line of searchArea) {
-            const candidate = line.trim();
-
-            // If a date has already been found in the search area, stop.
-            if (chequeDate !== 'N/A') break;
-
-            // STRICT PATTERN 1: Accepts only a solid 6-digit block, e.g., "010124"
-            let match = candidate.match(/^(\d{6})$/);
-            if (match) {
-                const day = match[1].substring(0, 2);
-                const month = match[1].substring(2, 4);
-                const year = `20${match[1].substring(4, 6)}`;
-                const parsedDate = moment(`${day}-${month}-${year}`, "DD-MM-YYYY", true);
-                if (parsedDate.isValid()) {
-                    chequeDate = parsedDate.format("DD-MM-YYYY");
-                    continue; // Found it, stop searching this line
-                }
-            }
-            
-            // STRICT PATTERN 2: Accepts only 6 digits separated by spaces, e.g., "2 5 0 9 12"
-            match = candidate.match(/^(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)$/);
-            if (match) {
-                const day = `${match[1]}${match[2]}`;
-                const month = `${match[3]}${match[4]}`;
-                const year = `20${match[5]}${match[6]}`;
-                const parsedDate = moment(`${day}-${month}-${year}`, "DD-MM-YYYY", true);
-                if (parsedDate.isValid()) {
-                    chequeDate = parsedDate.format("DD-MM-YYYY");
-                    continue; // Found it, stop searching this line
-                }
-            }
-        }
-    }
-    
-    // Assign the final result. If no strict pattern matched, it remains 'N/A'.
-    data.chequeDate = chequeDate;
-
-    if (data.chequeDate === 'N/A') {
-        data.needsReview = true;
-        data.reviewNotes.push("Date format is invalid or not found in the expected location.");
-    }
-
-
-    // --- Bank/Branch Code Center Extraction ---
-    const centerCodeRegex = /(\d{2}-\d{5})/;
-    const centerCodeMatch = rawText.match(centerCodeRegex);
-    if (centerCodeMatch) {
-        data.bankBranchCodeCenter = centerCodeMatch[1];
-    } else {
-        data.reviewNotes.push("Could not parse bank branch code center.");
-    }
+    // --- Refined Date Extraction Block is now REMOVED ---
 
     // --- Refined MICR Line Extraction ---
-    const micrLineCandidate = lines.find(line => (line.match(/\d/g) || []).length > 15 && (line.includes('I') || line.includes('"') || line.includes(':')));
+    const micrLineCandidate = lines.find(line => (line.match(/\d/g) || []).length > 15);
     if (micrLineCandidate) {
         data.micr.raw = micrLineCandidate.trim();
-        const cleanedMicr = micrLineCandidate.replace(/[^\d\s]/g, ' ').replace(/\s+/g, ' ').trim();
-        const parts = cleanedMicr.split(' ').filter(p => p.length > 1);
-
-        if (parts.length >= 4) {
-             data.micr.chequeNo = parts.find(p => p.length === 6 || p.length === 7);
-             const bankBranchPart = parts.find(p => p.length === 7 && p !== data.micr.chequeNo);
-             if(bankBranchPart) {
-                 data.micr.bankCode = bankBranchPart.substring(0, 4);
-                 data.micr.branchCode = bankBranchPart.substring(4);
-             }
-             data.micr.payerAccountNo = parts.find(p => p.length >= 8);
-             const tranCodePart = parts.filter(p => p.length === 2).pop();
-             if(tranCodePart) data.micr.tranCode = tranCodePart;
-        } else {
-            data.needsReview = true;
-            data.reviewNotes.push("Could not parse MICR line into meaningful parts.");
-        }
-    } else {
-        data.needsReview = true;
-        data.reviewNotes.push("Could not find or parse MICR line.");
-    }
-    
-    // --- Gemini Enhanced Parsing (as a fallback) ---
-    const geminiPrompt = `Analyze the following OCR text from a Malaysian cheque and extract the information into a clean JSON object. Do not include any markdown or explanatory text outside the JSON.
-    The JSON object must have these keys: "payeeName", "amount", "amountInWords", "chequeDate" (format DD-MM-YYYY), "payerName", "micr".
-    For the "micr" key, provide a nested object with: "chequeNo", "bankCode", "branchCode", "payerAccountNo", "tranCode".
-    If a value is unclear, use "N/A" for strings or 0 for numbers.
-    OCR Text: \`\`\`${rawText}\`\`\``;
-
-    try {
-        const geminiResponse = await callGeminiAPI(geminiPrompt, rawText);
-        if (geminiResponse) {
-            if ((data.payeeName === 'N/A' || data.payeeName.length < 3) && geminiResponse.payeeName && geminiResponse.payeeName !== 'N/A') data.payeeName = geminiResponse.payeeName;
-            if (data.amount === 0 && geminiResponse.amount && parseFloat(geminiResponse.amount) !== 0) data.amount = parseFloat(geminiResponse.amount);
-            if (data.amountInWords === 'N/A' && geminiResponse.amountInWords && geminiResponse.amountInWords !== 'N/A') data.amountInWords = geminiResponse.amountInWords;
-            // if (data.chequeDate === 'N/A' && geminiResponse.chequeDate && moment(geminiResponse.chequeDate, "DD-MM-YYYY", true).isValid()) data.chequeDate = geminiResponse.chequeDate;
-            
-            if (geminiResponse.payerName && geminiResponse.payerName !== 'N/A') data.payerName = geminiResponse.payerName;
-            
-            if (data.micr.chequeNo === 'N/A' && geminiResponse.micr) {
-                data.micr = { ...data.micr, ...geminiResponse.micr };
-            }
-        }
-    } catch (geminiError) {
-        console.error('Gemini API call failed during enhancement:', geminiError.message);
-        data.reviewNotes.push("Failed to get enhanced parsing from Gemini API.");
+        // Simplified MICR parsing can be added here if needed
     }
 
-    // --- Final Review Check ---
-    const requiredFields = ['payeeName', 'amount', 'amountInWords', 'chequeDate', 'micr.chequeNo', 'micr.tranCode'];
-    requiredFields.forEach(field => {
-        const value = field.includes('.') ? data[field.split('.')[0]][field.split('.')[1]] : data[field];
-        if (!value || value === 'N/A' || value === 0) {
-            data.needsReview = true;
-            // Add review note only if it's not already there
-            const note = `${field} missing or invalid.`;
-            if (!data.reviewNotes.includes(note)) {
-                data.reviewNotes.push(note);
-            }
-        }
-    });
-
-    const invalidCharRegex = /[^a-zA-Z\s.]/;
-    if (data.payeeName !== 'N/A' && invalidCharRegex.test(data.payeeName)) {
-        data.needsReview = true;
-        const note = "Payee name contains non-alphabetic characters.";
-        if (!data.reviewNotes.includes(note)) {
-            data.reviewNotes.push(note);
-        }
-    }
-
-    if(data.payerName === 'N/A') {
-        const note = 'payerName missing or invalid.';
-        if (!data.reviewNotes.includes(note)) {
-            data.needsReview = true;
-            data.reviewNotes.push(note);
-        }
-    }
-    
-    data.reviewNotes = [...new Set(data.reviewNotes)];
+    // --- Final Review Check (simplified) ---
+    if (data.payeeName === 'N/A') data.reviewNotes.push("Payee Name not found by Vision API.");
+    if (data.payerName === 'N/A') data.reviewNotes.push("Payer Name not found by Vision API.");
+    if (data.chequeDate === 'N/A') data.reviewNotes.push("Date not found by Vision API.");
+    if (data.amount === 0) data.reviewNotes.push("Amount could not be parsed.");
+    if (data.reviewNotes.length > 0) data.needsReview = true;
 
     return { ...data, rawText };
 };
