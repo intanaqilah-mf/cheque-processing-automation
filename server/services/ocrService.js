@@ -12,7 +12,6 @@ const callGeminiAPI = async (prompt, text) => {
         const response = await result.response;
         const fullResponseText = response.text();
 
-        // Use a regular expression to reliably find and extract the JSON object
         const jsonMatch = fullResponseText.match(/\{[\s\S]*\}/);
 
         if (jsonMatch && jsonMatch[0]) {
@@ -45,7 +44,6 @@ const processCheque = async (imagePath) => {
         throw new Error('Could not extract any text from the image.');
     }
 
-    // Clean the raw text before processing
     rawText = cleanRawText(rawText);
 
     const data = {
@@ -62,12 +60,31 @@ const processCheque = async (imagePath) => {
 
     const lines = rawText.split('\n');
 
-    // --- Refined Payee Name Extraction ---
-    const payeeRegex = /(?:PAY|BAYAR)\s*[:\/]?\s*(.*?)(?:\s*ATAU PEMBAWA|\s*OR BEARER)/i;
-    const payeeMatch = rawText.replace(/\n/g, ' ').match(payeeRegex);
-    if (payeeMatch && payeeMatch[1]) {
-        data.payeeName = payeeMatch[1].replace(/[`~@#$%^&*()_|+\-=?;:'",.<>\{\}\[\]\\\/]/gi, '').trim();
-    } else {
+    // --- Final, Highly-Targeted Payee Name Extraction ---
+    let payeeName = 'N/A';
+    // Find the line containing "PAY" or "BAYAR".
+    const payeeLineIndex = lines.findIndex(line => line.toUpperCase().includes('PAY') || line.toUpperCase().includes('BAYAR'));
+
+    if (payeeLineIndex !== -1) {
+        let rawPayeeLine = lines[payeeLineIndex];
+
+        // Surgically remove the "PAY/BAYAR" prefix and any non-alphabet characters next to it.
+        // This isolates the name that follows.
+        let cleanedPayeeLine = rawPayeeLine.replace(/^(PAY|BAYAR)[\s\/]*[^\sa-zA-Z0-9]*/i, '').trim();
+
+        // As a final safety net, remove any "SAMPLE" text that might be overlaid.
+        cleanedPayeeLine = cleanedPayeeLine.replace(/SAMPLE/gi, '').trim();
+        
+        // Remove any other text that may appear after the name on the same line.
+        const finalPayeeMatch = cleanedPayeeLine.match(/^([a-zA-Z0-9\s,.'-]*)/);
+        if (finalPayeeMatch && finalPayeeMatch[0]) {
+            payeeName = finalPayeeMatch[0].trim();
+        }
+    }
+    
+    data.payeeName = payeeName;
+
+    if (data.payeeName === 'N/A' || data.payeeName.length < 3) {
         data.needsReview = true;
         data.reviewNotes.push("Could not parse payee name.");
     }
@@ -93,13 +110,12 @@ const processCheque = async (imagePath) => {
     }
 
     // --- Refined Date Extraction ---
-    // Try to find a date in D D M M Y Y format first.
     const spacedDatePattern = /(?:Tarikh|Date)\s*:?\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(\d)/i;
     let dateMatch = rawText.match(spacedDatePattern);
     if (dateMatch) {
         const day = `${dateMatch[1]}${dateMatch[2]}`;
         const month = `${dateMatch[3]}${dateMatch[4]}`;
-        const year = `20${dateMatch[5]}${dateMatch[6]}`; // Assume 21st century
+        const year = `20${dateMatch[5]}${dateMatch[6]}`;
         const parsedDate = moment(`${day}-${month}-${year}`, "DD-MM-YYYY", true);
         if (parsedDate.isValid()) {
             data.chequeDate = parsedDate.format("DD-MM-YYYY");
@@ -108,7 +124,6 @@ const processCheque = async (imagePath) => {
             data.reviewNotes.push(`Invalid spaced date detected: ${day}-${month}-${year}.`);
         }
     } else {
-        // Fallback to other standard patterns
         const standardDatePattern = /(?:Tarikh|Date)\s*:?\s*(\d{1,2})[ \/-]?(\d{1,2})[ \/-]?(\d{2,4})/i;
         dateMatch = rawText.match(standardDatePattern);
         if (dateMatch) {
@@ -145,10 +160,9 @@ const processCheque = async (imagePath) => {
     if (micrLineCandidate) {
         data.micr.raw = micrLineCandidate.trim();
         const cleanedMicr = micrLineCandidate.replace(/[^\d\s]/g, ' ').replace(/\s+/g, ' ').trim();
-        const parts = cleanedMicr.split(' ').filter(p => p.length > 1); // Filter out single-digit noise
+        const parts = cleanedMicr.split(' ').filter(p => p.length > 1);
 
         if (parts.length >= 4) {
-             // Assign based on typical length and position
              data.micr.chequeNo = parts.find(p => p.length === 6 || p.length === 7);
              const bankBranchPart = parts.find(p => p.length === 7 && p !== data.micr.chequeNo);
              if(bankBranchPart) {
@@ -156,7 +170,6 @@ const processCheque = async (imagePath) => {
                  data.micr.branchCode = bankBranchPart.substring(4);
              }
              data.micr.payerAccountNo = parts.find(p => p.length >= 8);
-             // Tran code is the last 2-digit number
              const tranCodePart = parts.filter(p => p.length === 2).pop();
              if(tranCodePart) data.micr.tranCode = tranCodePart;
         } else {
@@ -178,16 +191,13 @@ const processCheque = async (imagePath) => {
     try {
         const geminiResponse = await callGeminiAPI(geminiPrompt, rawText);
         if (geminiResponse) {
-            // Overwrite fields only if Gemini provides a valid value and regex failed
-            if (data.payeeName === 'N/A' && geminiResponse.payeeName && geminiResponse.payeeName !== 'N/A') data.payeeName = geminiResponse.payeeName;
+            if ((data.payeeName === 'N/A' || data.payeeName.length < 3) && geminiResponse.payeeName && geminiResponse.payeeName !== 'N/A') data.payeeName = geminiResponse.payeeName;
             if (data.amount === 0 && geminiResponse.amount && parseFloat(geminiResponse.amount) !== 0) data.amount = parseFloat(geminiResponse.amount);
             if (data.amountInWords === 'N/A' && geminiResponse.amountInWords && geminiResponse.amountInWords !== 'N/A') data.amountInWords = geminiResponse.amountInWords;
             if (data.chequeDate === 'N/A' && geminiResponse.chequeDate && moment(geminiResponse.chequeDate, "DD-MM-YYYY", true).isValid()) data.chequeDate = geminiResponse.chequeDate;
             
-            // Payer name is primarily handled by Gemini due to its complex positioning
             if (geminiResponse.payerName && geminiResponse.payerName !== 'N/A') data.payerName = geminiResponse.payerName;
             
-            // Overwrite MICR fields if regex failed
             if (data.micr.chequeNo === 'N/A' && geminiResponse.micr) {
                 data.micr = { ...data.micr, ...geminiResponse.micr };
             }
@@ -203,13 +213,20 @@ const processCheque = async (imagePath) => {
         const value = field.includes('.') ? data[field.split('.')[0]][field.split('.')[1]] : data[field];
         if (!value || value === 'N/A' || value === 0) {
             data.needsReview = true;
-            data.reviewNotes.push(`${field} missing or invalid.`);
+            // Add review note only if it's not already there
+            const note = `${field} missing or invalid.`;
+            if (!data.reviewNotes.includes(note)) {
+                data.reviewNotes.push(note);
+            }
         }
     });
 
     if(data.payerName === 'N/A') {
-        data.needsReview = true;
-        data.reviewNotes.push('payerName missing or invalid.');
+        const note = 'payerName missing or invalid.';
+        if (!data.reviewNotes.includes(note)) {
+            data.needsReview = true;
+            data.reviewNotes.push(note);
+        }
     }
     
     data.reviewNotes = [...new Set(data.reviewNotes)];
