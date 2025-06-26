@@ -6,7 +6,10 @@ const ChequeSchema = new mongoose.Schema({
     amountInWords: { type: String, default: 'N/A' },
     chequeDate: { type: String, default: 'N/A' },
     payerName: { type: String, default: 'N/A' },
+    payerAccountNo: { type: String, default: 'N/A' },     // ADDED THIS LINE
+    hasSignature: { type: Boolean, default: true },         // ADDED THIS LINE
     micr: {
+        cdv: { type: String, default: 'N/A' },              // ADDED THIS LINE
         raw: { type: String, default: 'N/A' },
         chequeNo: { type: String, default: 'N/A' },
         bankCode: { type: String, default: 'N/A' },
