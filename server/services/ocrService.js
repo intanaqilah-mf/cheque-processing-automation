@@ -125,19 +125,19 @@ const processCheque = async (imagePath) => {
     // =================================================================
     // Confidence and Data Quality Checks for n8n Alerts
     // =================================================================
-    const confidenceThreshold = 95;
+    const confidenceThreshold = 90;
 
     if (visionData?.payeeName?.confidence < confidenceThreshold) {
-        data.reviewNotes.push(`Low confidence for Payee Name (<95%): ${visionData.payeeName.reason}`);
+        data.reviewNotes.push(`Low confidence for Payee Name (<90%): ${visionData.payeeName.reason}`);
     }
     if (visionData?.amountInWords?.confidence < confidenceThreshold) {
-        data.reviewNotes.push(`Low confidence for Amount in Words (<95%): ${visionData.amountInWords.reason}`);
+        data.reviewNotes.push(`Low confidence for Amount in Words (<90%): ${visionData.amountInWords.reason}`);
     }
     if (visionData?.chequeDate?.confidence < confidenceThreshold) {
-        data.reviewNotes.push(`Low confidence for Cheque Date (<95%): ${visionData.chequeDate.reason}`);
+        data.reviewNotes.push(`Low confidence for Cheque Date (<90%): ${visionData.chequeDate.reason}`);
     }
     if (visionData?.amount?.confidence < confidenceThreshold) {
-        data.reviewNotes.push(`Low confidence for Amount (<95%): ${visionData.amount.reason}`);
+        data.reviewNotes.push(`Low confidence for Amount (<90%): ${visionData.amount.reason}`);
     }
     
     // NEW: Regex check for invalid characters in amount
