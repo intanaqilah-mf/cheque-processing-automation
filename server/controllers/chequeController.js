@@ -1,7 +1,4 @@
-// server/controllers/chequeController.js
-
 const Cheque = require('../models/Cheque');
-// We now only need to import the single 'processCheque' function
 const { processCheque } = require('../services/ocrService');
 const fs = require('fs');
 const axios = require('axios');
@@ -12,16 +9,12 @@ const processNewCheque = async (req, res) => {
     }
 
     try {
-        // --- THIS IS THE UPDATED LOGIC ---
-        // Call the single, powerful function to get all extracted data at once.
         const extractedData = await processCheque(req.file.path);
 
-        // Create the new cheque document with the data from the service.
         const newCheque = new Cheque({
             ...extractedData,
-            imageUrl: req.file.filename, // Keep using .filename for the image URL
+            imageUrl: req.file.filename,
         });
-        // --- END OF UPDATED LOGIC ---
 
         await newCheque.save();
 
@@ -32,9 +25,6 @@ const processNewCheque = async (req, res) => {
                 console.error("Failed to trigger n8n webhook:", error.message);
             }
         }
-        
-        // We will keep the image file now so it can be displayed
-        // fs.unlinkSync(req.file.path); 
         
         res.status(201).json(newCheque);
 
