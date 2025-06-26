@@ -24,6 +24,20 @@ const callGeminiAPI = async (prompt, text) => {
         return null;
     }
 };
+const callGeminiTextAPI = async (prompt) => {
+    const { GoogleGenerativeAI } = require('@google/generative-ai');
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+    try {
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        return response.text();
+    } catch (error) {
+        console.error('Error calling Gemini Text API:', error);
+        return null;
+    }
+};
 
 // Helper function to remove known non-data text from the raw OCR output.
 const cleanRawText = (text) => {
@@ -84,29 +98,55 @@ const processCheque = async (imagePath) => {
     
     data.payeeName = payeeName;
 
-    if (data.payeeName === 'N/A' || data.payeeName.length < 3) {
-        data.needsReview = true;
-        data.reviewNotes.push("Could not parse payee name.");
-    }
+    const rawAmountRegex = /RM\s*(.*)/i;
+     const rawAmountMatch = rawText.match(rawAmountRegex);
 
-    // --- Amount (Figures) Extraction ---
-    const amountRegex = /RM\s*\*?([\d,]+\.\d{2})/i;
-    let amountMatch = rawText.match(amountRegex);
-    if (amountMatch && amountMatch[1]) {
-        data.amount = parseFloat(amountMatch[1].replace(/,/g, ''));
-    } else {
-        data.needsReview = true;
-        data.reviewNotes.push("Could not parse amount in figures.");
+         if (rawAmountMatch && rawAmountMatch[1]) {
+         const rawAmountStr = rawAmountMatch[1].trim();
+
+         const cleanedAmountStr = rawAmountStr.replace(/[^\d.]/g, '');
+         if (/[a-zA-Z-\/]/.test(rawAmountStr)) {
+             data.needsReview = true;
+            data.reviewNotes.push("Amount in figures contains invalid characters.");
     }
+    if (cleanedAmountStr) {
+             data.amount = parseFloat(cleanedAmountStr);
+            } else {
+             data.amount = 0;
+             }
+
+        } else {
+         data.needsReview = true;
+             data.reviewNotes.push("Could not parse amount in figures.");
+     }
 
     // --- Amount (Words) Extraction ---
-    const amountWordsRegex = /(?:RINGGIT MALAYSIA|RINGGIT)\s*:?\s*([A-Z\s]+?)(?:SAHAJA|ONLY)/i;
+    const amountWordsRegex = /(?:RINGGIT MALAYSIA|RINGGIT)[\s\S]*?([a-zA-Z\s.,'-]+?)(?:SAHAJA|ONLY)/i;
     const amountWordsMatch = rawText.match(amountWordsRegex);
     if (amountWordsMatch && amountWordsMatch[1]) {
         data.amountInWords = amountWordsMatch[1].replace(/\s+/g, ' ').trim();
     } else {
         data.needsReview = true;
         data.reviewNotes.push("Could not parse amount in words.");
+    }
+
+    if (data.amountInWords !== 'N/A') {
+        const validationPrompt = `Does the following text describe a number in English or Malay, even with potential spelling errors? Answer only with a single word: YES or NO.\n\nText: "${data.amountInWords}"`;
+
+        try {
+            // CORRECTED: Use the new function for text-only responses.
+            const validationResponse = await callGeminiTextAPI(validationPrompt);
+            
+            if (!validationResponse || validationResponse.trim().toUpperCase() !== 'YES') {
+                data.needsReview = true;
+                data.reviewNotes.push("Amount in words is not a valid number description.");
+            }
+        } catch (error) {
+            console.error('AI validation for amount in words failed:', error);
+            // Flag for review if the validation check itself fails.
+            data.needsReview = true;
+            data.reviewNotes.push("Could not verify the amount in words."); 
+        }
     }
 
     // --- Refined Date Extraction ---
@@ -234,6 +274,15 @@ const processCheque = async (imagePath) => {
             }
         }
     });
+
+    const invalidCharRegex = /[^a-zA-Z\s.]/;
+    if (data.payeeName !== 'N/A' && invalidCharRegex.test(data.payeeName)) {
+        data.needsReview = true;
+        const note = "Payee name contains non-alphabetic characters.";
+        if (!data.reviewNotes.includes(note)) {
+            data.reviewNotes.push(note);
+        }
+    }
 
     if(data.payerName === 'N/A') {
         const note = 'payerName missing or invalid.';
