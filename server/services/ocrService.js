@@ -40,6 +40,14 @@ const processCheque = async (imagePath) => {
     const [result] = await client.textDetection(imagePath);
     let rawText = result.fullTextAnnotation?.text;
 
+    // =================================================================
+    // THIS IS THE LOG YOU ASKED FOR.
+    // It prints the entire raw text from the OCR before any cleaning or processing.
+    console.log('-------------------- RAW OCR OUTPUT START --------------------');
+    console.log(rawText);
+    console.log('--------------------  RAW OCR OUTPUT END  --------------------');
+    // =================================================================
+
     if (!rawText) {
         throw new Error('Could not extract any text from the image.');
     }
@@ -62,20 +70,12 @@ const processCheque = async (imagePath) => {
 
     // --- Final, Highly-Targeted Payee Name Extraction ---
     let payeeName = 'N/A';
-    // Find the line containing "PAY" or "BAYAR".
     const payeeLineIndex = lines.findIndex(line => line.toUpperCase().includes('PAY') || line.toUpperCase().includes('BAYAR'));
 
     if (payeeLineIndex !== -1) {
         let rawPayeeLine = lines[payeeLineIndex];
-
-        // Surgically remove the "PAY/BAYAR" prefix and any non-alphabet characters next to it.
-        // This isolates the name that follows.
         let cleanedPayeeLine = rawPayeeLine.replace(/^(PAY|BAYAR)[\s\/]*[^\sa-zA-Z0-9]*/i, '').trim();
-
-        // As a final safety net, remove any "SAMPLE" text that might be overlaid.
         cleanedPayeeLine = cleanedPayeeLine.replace(/SAMPLE/gi, '').trim();
-        
-        // Remove any other text that may appear after the name on the same line.
         const finalPayeeMatch = cleanedPayeeLine.match(/^([a-zA-Z0-9\s,.'-]*)/);
         if (finalPayeeMatch && finalPayeeMatch[0]) {
             payeeName = finalPayeeMatch[0].trim();
